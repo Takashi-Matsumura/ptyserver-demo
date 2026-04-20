@@ -10,7 +10,10 @@ import {
 
 // 学習用デモのためのリソースリミット。多ユーザ/本番用途には不十分で、
 // rootless Docker / userns-remap / gVisor / NetworkMode:"none" 等の強化が必要。
-const IMAGE = "ubuntu:24.04";
+// Step 5: ubuntu:24.04 をそのまま使うのではなく、vim/git/curl などを
+// 同梱した自前イメージを docker/sandbox/Dockerfile からビルドして使う。
+const IMAGE = "ptyserver-demo-sandbox:latest";
+const DOCKERFILE_CONTEXT = "docker/sandbox";
 const HOME_VOLUME = "ptyserver-demo-home";
 const HOME_MOUNT_PATH = "/root";
 const MEM_BYTES = 512 * 1024 * 1024; // 512 MiB
@@ -27,20 +30,42 @@ const CONTAINER_LABEL_VALUE = "session";
 
 const docker = new Docker();
 
-export async function ensureImagePulled(): Promise<void> {
+// docker/sandbox/Dockerfile から自前イメージをビルドする。既にイメージが
+// 存在すればスキップ。Dockerfile を書き換えた場合は手動で
+// `docker rmi ptyserver-demo-sandbox:latest` してから再起動することで
+// 再ビルドされる（検知機能は持たない）。
+export async function ensureImageBuilt(): Promise<void> {
   try {
     await docker.getImage(IMAGE).inspect();
     console.log(`[docker] image ready: ${IMAGE}`);
     return;
   } catch {
-    // not present — pull
+    // not present — build
   }
-  console.log(`[docker] pulling ${IMAGE}…`);
-  const stream = await docker.pull(IMAGE);
+  console.log(`[docker] building ${IMAGE} from ${DOCKERFILE_CONTEXT}/Dockerfile…`);
+  const buildStream = await docker.buildImage(
+    { context: DOCKERFILE_CONTEXT, src: ["Dockerfile"] },
+    { t: IMAGE, rm: true },
+  );
   await new Promise<void>((resolve, reject) => {
-    docker.modem.followProgress(stream, (err) => (err ? reject(err) : resolve()));
+    docker.modem.followProgress(
+      buildStream,
+      (err, res) => {
+        if (err) return reject(err);
+        // followProgress の res は行ごとの JSON を配列化したもの。
+        // 最後まで走り切っていてもビルド失敗行が混ざっていることがあるので拾う。
+        const errorLine = (res as Array<{ error?: string }> | null)?.find((r) => r?.error);
+        if (errorLine?.error) return reject(new Error(errorLine.error));
+        resolve();
+      },
+      (event) => {
+        const s = (event as { stream?: string }).stream;
+        // daemon からの生ログをサーバログにそのまま流す
+        if (s) process.stdout.write(`[docker] build: ${s}`);
+      },
+    );
   });
-  console.log(`[docker] pulled ${IMAGE}`);
+  console.log(`[docker] built ${IMAGE}`);
 }
 
 export async function ensureHomeVolume(): Promise<void> {
