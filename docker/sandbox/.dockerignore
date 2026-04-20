@@ -1,0 +1,4 @@
+# 今のところ Dockerfile だけを build context に入れたいので、
+# 明示的にそれ以外を除外する（将来ファイルを増やしたら見直す）。
+*
+!Dockerfile
