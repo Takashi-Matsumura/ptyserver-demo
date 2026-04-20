@@ -3,6 +3,8 @@ import next from "next";
 import { WebSocketServer } from "ws";
 import {
   attachDockerSession,
+  cleanupOrphanSessionContainers,
+  ensureHomeVolume,
   ensureImagePulled,
 } from "./lib/docker-session";
 
@@ -15,11 +17,17 @@ const app = next({ dev, httpServer });
 const handle = app.getRequestHandler();
 
 app.prepare().then(async () => {
-  // 接続ごとの遅延を避けるため、サーバ起動時に 1 回だけイメージ確認＋pull
+  // 接続ごとの遅延を避けるため、サーバ起動時に 1 回だけイメージ確認＋pull、
+  // および永続ホームボリュームを ensure（無ければ作成）。
+  // 加えて、前回クラッシュや race で残った自分のコンテナをここで一掃する。
   try {
-    await ensureImagePulled();
+    await Promise.all([
+      ensureImagePulled(),
+      ensureHomeVolume(),
+      cleanupOrphanSessionContainers(),
+    ]);
   } catch (err) {
-    console.error("[server] image pull failed — sessions will error until fixed:", err);
+    console.error("[server] startup prep failed — sessions may error until fixed:", err);
   }
 
   httpServer.on("request", (req, res) => {
