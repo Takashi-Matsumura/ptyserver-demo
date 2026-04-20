@@ -2,6 +2,7 @@
   "name": "ptyserver-demo",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "dev": "tsx watch --clear-screen=false server.ts",
     "build": "next build",
