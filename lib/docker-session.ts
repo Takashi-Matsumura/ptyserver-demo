@@ -18,10 +18,10 @@ const NANO_CPUS = 1_000_000_000; // 1.0 CPU
 const PID_LIMIT = 256;
 
 const HEARTBEAT_MS = 30_000;
-// bash が SIGTERM を受けて .bash_history 等を書き出す猶予
-const STOP_GRACE_SECONDS = 2;
 
-// コンテナに付与するラベル。起動時の孤児一掃と、自分が作ったコンテナの識別に使う
+// 単一の永続コンテナ。WS 切断や PC スリープをまたいで維持し、明示的な
+// 破棄（DELETE /api/session）まで残す。アプリ全体で 1 個。
+const CONTAINER_NAME = "ptyserver-demo-shell";
 const CONTAINER_LABEL_KEY = "io.ptyserver-demo.role";
 const CONTAINER_LABEL_VALUE = "session";
 
@@ -58,31 +58,90 @@ export async function ensureHomeVolume(): Promise<void> {
   console.log(`[docker] home volume created: ${HOME_VOLUME}`);
 }
 
-// サーバ起動時に、前回走らせていた自分のコンテナが残っていれば掃除する。
-// dev サーバをクラッシュ再起動した時や、race で孤児化した場合の保険。
-export async function cleanupOrphanSessionContainers(): Promise<void> {
-  const containers = await docker.listContainers({
-    all: true,
-    filters: { label: [`${CONTAINER_LABEL_KEY}=${CONTAINER_LABEL_VALUE}`] },
-  });
-  if (containers.length === 0) {
-    console.log("[docker] no orphan session containers");
-    return;
+// 単一の永続コンテナを ensure する。
+// - 無ければ作成
+// - 止まっていれば start
+// - 動いていればそのまま返す
+// 名前衝突による race は createContainer の 409 を拾って再 inspect で吸収する。
+async function ensureSessionContainer(): Promise<Docker.Container> {
+  const existing = docker.getContainer(CONTAINER_NAME);
+  try {
+    const info = await existing.inspect();
+    if (!info.State.Running) {
+      await existing.start();
+      console.log(`[docker] started existing container: ${CONTAINER_NAME}`);
+    }
+    return existing;
+  } catch (err) {
+    const status = (err as { statusCode?: number }).statusCode;
+    if (status !== 404) throw err;
   }
-  console.log(`[docker] removing ${containers.length} orphan session container(s)`);
-  await Promise.all(
-    containers.map(async (info) => {
-      try {
-        await docker.getContainer(info.Id).remove({ force: true });
-      } catch {
-        // already gone
-      }
-    }),
-  );
+
+  try {
+    const created = await docker.createContainer({
+      name: CONTAINER_NAME,
+      Image: IMAGE,
+      Cmd: ["sleep", "infinity"],
+      Tty: true,
+      OpenStdin: true,
+      WorkingDir: "/root",
+      Env: ["TERM=xterm-256color"],
+      Labels: { [CONTAINER_LABEL_KEY]: CONTAINER_LABEL_VALUE },
+      HostConfig: {
+        // 明示破棄されるまで残す
+        AutoRemove: false,
+        RestartPolicy: { Name: "unless-stopped" },
+        Memory: MEM_BYTES,
+        NanoCpus: NANO_CPUS,
+        PidsLimit: PID_LIMIT,
+        NetworkMode: "bridge",
+        // 「ALL ドロップ → 必要分だけ加え戻す」方針。
+        // SETUID/SETGID/CHOWN は apt などが内部で権限降格・ファイルオーナー変更に使う。
+        // DAC_OVERRIDE/FOWNER/FSETID は /var/lib/apt などの書き込みに関わる。
+        CapDrop: ["ALL"],
+        CapAdd: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETGID", "SETUID"],
+        SecurityOpt: ["no-new-privileges"],
+        Mounts: [
+          {
+            Type: "volume",
+            Source: HOME_VOLUME,
+            Target: HOME_MOUNT_PATH,
+          },
+        ],
+      },
+    });
+    await created.start();
+    console.log(`[docker] created container: ${CONTAINER_NAME}`);
+    return created;
+  } catch (err) {
+    // 並行で他リクエストが先に作ったケース（409 Conflict）
+    const status = (err as { statusCode?: number }).statusCode;
+    if (status === 409) {
+      const existing = docker.getContainer(CONTAINER_NAME);
+      const info = await existing.inspect();
+      if (!info.State.Running) await existing.start();
+      return existing;
+    }
+    throw err;
+  }
+}
+
+// 明示破棄: DELETE /api/session から呼ぶ。コンテナごと消す。
+// /root は named volume に分離してあるのでシェル履歴等は残らないが、
+// ホームボリュームに置いたファイル（apt でユーザが入れたバイナリは /usr 側にあるので消える）は維持される。
+export async function removeSessionContainer(): Promise<boolean> {
+  try {
+    await docker.getContainer(CONTAINER_NAME).remove({ force: true });
+    console.log(`[docker] removed container: ${CONTAINER_NAME}`);
+    return true;
+  } catch (err) {
+    const status = (err as { statusCode?: number }).statusCode;
+    if (status === 404) return false; // そもそも無かった
+    throw err;
+  }
 }
 
 export function attachDockerSession(ws: WebSocket): void {
-  // async 本体を IIFE で起動し、例外は WS 経由でクライアントに伝える
   void run(ws).catch((err) => {
     console.error("[docker] session error", err);
     try {
@@ -97,65 +156,16 @@ export function attachDockerSession(ws: WebSocket): void {
 }
 
 async function run(ws: WebSocket): Promise<void> {
-  // React Strict Mode やネットワーク遅延により WS が setup 完了前に close される
-  // ことがある。setup 中の各 await 後に aborted を確認し、作ったリソースを能動的に
-  // 片付ける。ws.on("close") は最初の await より前に登録しないと、登録前に発火した
-  // close イベントを取りこぼして孤児コンテナが残る。
+  // setup 中に WS が切れるケース（React Strict Mode 等）に備えて abort フラグを持つ。
+  // ただしコンテナ自体は永続なので、abort 時に消すのは exec の stream だけ。
   let aborted = false;
   ws.on("close", () => {
     aborted = true;
   });
 
-  const container = await docker.createContainer({
-    Image: IMAGE,
-    Cmd: ["sleep", "infinity"],
-    Tty: true,
-    OpenStdin: true,
-    WorkingDir: "/root",
-    Env: ["TERM=xterm-256color"],
-    Labels: { [CONTAINER_LABEL_KEY]: CONTAINER_LABEL_VALUE },
-    HostConfig: {
-      AutoRemove: true,
-      Memory: MEM_BYTES,
-      NanoCpus: NANO_CPUS,
-      PidsLimit: PID_LIMIT,
-      NetworkMode: "bridge",
-      // 「ALL ドロップ → 必要分だけ加え戻す」方針。
-      // SETUID/SETGID/CHOWN は apt などが内部で権限降格・ファイルオーナー変更に使う。
-      // DAC_OVERRIDE/FOWNER/FSETID は /var/lib/apt などの書き込みに関わる。
-      // これらは「コンテナ内で完結する通常のユーザ操作」に必要で、ホスト脱出には直結しない。
-      CapDrop: ["ALL"],
-      CapAdd: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETGID", "SETUID"],
-      SecurityOpt: ["no-new-privileges"],
-      // /root のみ named volume に永続化。apt で /usr や /var/lib 配下に入るものは
-      // コンテナ破棄とともに消える（これは意図した挙動）。
-      Mounts: [
-        {
-          Type: "volume",
-          Source: HOME_VOLUME,
-          Target: HOME_MOUNT_PATH,
-        },
-      ],
-    },
-  });
-
+  const container = await ensureSessionContainer();
   const shortId = container.id.slice(0, 12);
-
-  // container 作成済み・未 start 状態で abort された場合は remove で片付ける
-  // （AutoRemove は stop からしか発火しない）
-  if (aborted) {
-    await container.remove({ force: true }).catch(() => {});
-    console.log(`[docker] aborted pre-start: ${shortId}`);
-    return;
-  }
-
-  await container.start();
-  console.log(`[docker] container started: ${shortId}`);
-  if (aborted) {
-    await container.stop({ t: 0 }).catch(() => {});
-    console.log(`[docker] aborted post-start: ${shortId}`);
-    return;
-  }
+  if (aborted) return;
 
   const exec = await container.exec({
     Cmd: ["/bin/bash", "-l"],
@@ -165,28 +175,33 @@ async function run(ws: WebSocket): Promise<void> {
     Tty: true,
     Env: ["TERM=xterm-256color"],
   });
-  if (aborted) {
-    await container.stop({ t: 0 }).catch(() => {});
-    console.log(`[docker] aborted post-exec: ${shortId}`);
-    return;
-  }
+  if (aborted) return;
 
-  const stream = (await exec.start({ hijack: true, stdin: true })) as Duplex;
+  // Tty:true を start 側にも渡さないと Docker daemon が multiplex ストリーム
+  // （8 バイトの stdout/stderr demux header 付き）で返してしまう。
+  // その header の size LSB バイトが TTY 出力として xterm に流れ、プロンプト冒頭に
+  // '6' や 'A' といった謎の文字が出る原因になる。
+  const stream = (await exec.start({
+    hijack: true,
+    stdin: true,
+    Tty: true,
+  })) as Duplex;
   if (aborted) {
     try {
       stream.destroy();
     } catch {
       // ignore
     }
-    await container.stop({ t: 0 }).catch(() => {});
-    console.log(`[docker] aborted post-stream: ${shortId}`);
     return;
   }
 
   ws.send(encodeStatus({ kind: "spawn" }));
+  console.log(`[docker] attached to container: ${shortId}`);
 
   let cleanedUp = false;
-  const cleanup = async () => {
+  // WS 切断時のクリーンアップ。コンテナは止めない — exec stream を閉じるだけ。
+  // これでブラウザを閉じても次回接続時に同じ環境へ戻れる。
+  const cleanup = () => {
     if (cleanedUp) return;
     cleanedUp = true;
     clearInterval(heartbeat);
@@ -196,19 +211,9 @@ async function run(ws: WebSocket): Promise<void> {
     } catch {
       // ignore
     }
-    try {
-      await container.stop({ t: STOP_GRACE_SECONDS });
-    } catch (err) {
-      const status = (err as { statusCode?: number }).statusCode;
-      // 304: already stopped, 404: already removed by AutoRemove
-      if (status !== 304 && status !== 404) {
-        console.warn("[docker] stop error", err);
-      }
-    }
-    console.log(`[docker] container stopped: ${shortId}`);
+    console.log(`[docker] detached from container: ${shortId}`);
   };
 
-  // hijacked stream (Tty:true) は多重化なし、生バイトがそのまま来る
   stream.on("data", (chunk: Buffer) => {
     if (ws.readyState !== ws.OPEN) return;
     ws.send(encodeStdout(new Uint8Array(chunk)), { binary: true });
@@ -218,11 +223,11 @@ async function run(ws: WebSocket): Promise<void> {
       ws.send(encodeStatus({ kind: "exit", code: 0 }));
       ws.close();
     }
-    void cleanup();
+    cleanup();
   });
   stream.on("error", (err) => {
     console.warn("[docker] stream error", err);
-    void cleanup();
+    cleanup();
   });
 
   ws.on("message", (data, isBinary) => {
@@ -251,14 +256,10 @@ async function run(ws: WebSocket): Promise<void> {
     if (ws.readyState === ws.OPEN) ws.ping();
   }, HEARTBEAT_MS);
 
-  // setup 完了後に正規の cleanup ハンドラで上書き
   ws.removeAllListeners("close");
   ws.on("close", () => {
-    void cleanup();
+    cleanup();
   });
 
-  // setup 中に abort 指示が来ていた場合はここで cleanup
-  if (aborted) {
-    void cleanup();
-  }
+  if (aborted) cleanup();
 }
