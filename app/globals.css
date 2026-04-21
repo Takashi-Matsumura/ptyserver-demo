@@ -24,3 +24,45 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/*
+  xterm.js の DOM renderer は .xterm-viewport に background-color: #000 を
+  直接ハードコードしており、さらに theme.background に rgba を渡しても
+  ThemeService.parseColor がアルファ付きを reject して黒フォールバックする。
+  そのうえ、xterm が動的に注入する行コンテナ側の style も不透明な色を敷くため、
+  `.xterm *` まで広げて一旦全ての background を落とす必要がある（検証済み）。
+  裏に敷いた gradient が文字の奥に透けて見える状態にするのが狙い。
+*/
+.xterm,
+.xterm *,
+.xterm canvas,
+.xterm .xterm-viewport,
+.xterm .xterm-screen,
+.xterm .xterm-rows,
+.xterm .xterm-rows > div {
+  background-color: transparent !important;
+  background-image: none !important;
+  background: transparent !important;
+}
+
+/* カーソル（block cursor）は上の *-killer で透明になってしまうので個別に色を戻す */
+.xterm .xterm-cursor.xterm-cursor-block {
+  background-color: #e6e6e6 !important;
+}
+
+/* テキスト選択ハイライトも同様に復活 */
+.xterm .xterm-selection div,
+.xterm.focus .xterm-selection div {
+  background-color: rgba(255, 255, 255, 0.25) !important;
+}
+
+/* 背景の gradient / Ubuntu ロゴを透かすため、スクロールバーは非表示にする。
+   xterm.js 側のホイール処理でバッファは問題なくスクロールできる。 */
+.xterm .xterm-viewport {
+  scrollbar-width: none;
+}
+.xterm .xterm-viewport::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
