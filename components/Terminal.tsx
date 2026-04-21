@@ -12,6 +12,7 @@ import {
 } from "@/lib/ws-protocol";
 
 type ConnectionState = "connecting" | "open" | "closed";
+type NetworkMode = "bridge" | "none";
 
 export default function Terminal() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -26,6 +27,8 @@ export default function Terminal() {
   const aliveRef = useRef(true);
   const [status, setStatus] = useState<ConnectionState>("connecting");
   const [busy, setBusy] = useState(false);
+  // 現在のセッションコンテナのネットワークモード。初期 null の間は「読み込み中」表示。
+  const [networkMode, setNetworkMode] = useState<NetworkMode | null>(null);
 
   // 再接続含め、WebSocket を一本張る処理。xterm 本体は破棄せず使い回すため、
   // status 変化 / ボタン操作から何度でも呼べる。
@@ -142,6 +145,16 @@ export default function Terminal() {
 
     connect();
 
+    // 現状のネットワークモードを 1 回取りにいく（表示用）。失敗しても致命ではない。
+    fetch("/api/session")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { networkMode?: NetworkMode } | null) => {
+        if (data?.networkMode) setNetworkMode(data.networkMode);
+      })
+      .catch(() => {
+        // ignore — モード不明のまま操作で切替可能
+      });
+
     const resizeObserver = new ResizeObserver(() => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -204,6 +217,42 @@ export default function Terminal() {
     }
   }, [busy, connect]);
 
+  const switchNetworkMode = useCallback(async () => {
+    if (busy || networkMode == null) return;
+    const next: NetworkMode = networkMode === "none" ? "bridge" : "none";
+    const nextLabel = next === "none" ? "遮断" : "接続";
+    if (
+      !confirm(
+        `ネットワークを「${nextLabel}」に切り替えます。コンテナは作り直され、/root 以外にインストール/作成したもの（apt のパッケージ、/tmp のファイル等）は失われます。続行しますか？`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    try {
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch {
+          // ignore
+        }
+      }
+      const res = await fetch("/api/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ networkMode: next }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setNetworkMode(next);
+      termRef.current?.clear();
+      connect();
+    } catch (err) {
+      alert(`切替に失敗しました: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, networkMode, connect]);
+
   const statusLabel =
     status === "open"
       ? "● 接続中"
@@ -211,11 +260,50 @@ export default function Terminal() {
         ? "… 接続試行中"
         : "○ 切断";
 
+  const netLabel =
+    networkMode == null
+      ? "ネットワーク: …"
+      : networkMode === "none"
+        ? "ネットワーク: 遮断"
+        : "ネットワーク: 接続";
+  const netSwitchLabel =
+    networkMode == null
+      ? "…"
+      : networkMode === "none"
+        ? "ネットワークを有効化"
+        : "ネットワークを遮断";
+
   return (
     <div className="flex h-screen flex-col bg-[#0b1020] text-slate-200">
       <header className="flex items-center justify-between border-b border-slate-700 px-4 py-2 text-sm">
         <span className="font-semibold">PTY Sandbox</span>
         <div className="flex items-center gap-3">
+          <span
+            className={
+              networkMode === "none"
+                ? "text-orange-300"
+                : networkMode === "bridge"
+                  ? "text-sky-300"
+                  : "text-slate-500"
+            }
+            title={
+              networkMode === "none"
+                ? "NetworkMode: none（lo のみ、DNS・外部通信不可）"
+                : networkMode === "bridge"
+                  ? "NetworkMode: bridge（通常の外部通信あり）"
+                  : ""
+            }
+          >
+            {netLabel}
+          </span>
+          <button
+            type="button"
+            onClick={switchNetworkMode}
+            disabled={busy || networkMode == null}
+            className="rounded border border-slate-600 px-2 py-0.5 text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+          >
+            {netSwitchLabel}
+          </button>
           <span
             className={
               status === "open"

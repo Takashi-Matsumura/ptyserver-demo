@@ -28,6 +28,17 @@ const CONTAINER_NAME = "ptyserver-demo-shell";
 const CONTAINER_LABEL_KEY = "io.ptyserver-demo.role";
 const CONTAINER_LABEL_VALUE = "session";
 
+// Step 6: ネットワーク遮断モード
+// bridge = 通常（外部通信可）/ none = 遮断（lo のみ、DNS 不可）
+// Docker の NetworkMode は create 時に確定するため、切替には既存コンテナを
+// 破棄して作り直す必要がある。「次のモード」を module 変数で保持しようと
+// すると、Next.js API route と custom server で本ファイルが別バンドルに
+// なって変数が共有されない事故が起きる。そこで「唯一の真は docker daemon」
+// という方針を取り、状態は持たない。切替時は API の中で remove→create まで
+// 完結させる。
+export type NetworkMode = "bridge" | "none";
+const DEFAULT_NETWORK_MODE: NetworkMode = "bridge";
+
 const docker = new Docker();
 
 // docker/sandbox/Dockerfile から自前イメージをビルドする。既にイメージが
@@ -83,25 +94,11 @@ export async function ensureHomeVolume(): Promise<void> {
   console.log(`[docker] home volume created: ${HOME_VOLUME}`);
 }
 
-// 単一の永続コンテナを ensure する。
-// - 無ければ作成
-// - 止まっていれば start
-// - 動いていればそのまま返す
-// 名前衝突による race は createContainer の 409 を拾って再 inspect で吸収する。
-async function ensureSessionContainer(): Promise<Docker.Container> {
-  const existing = docker.getContainer(CONTAINER_NAME);
-  try {
-    const info = await existing.inspect();
-    if (!info.State.Running) {
-      await existing.start();
-      console.log(`[docker] started existing container: ${CONTAINER_NAME}`);
-    }
-    return existing;
-  } catch (err) {
-    const status = (err as { statusCode?: number }).statusCode;
-    if (status !== 404) throw err;
-  }
-
+// 指定モードで新しいセッションコンテナを create + start する。
+// ensureSessionContainer からも setSessionNetworkMode からも使う共通ロジック。
+async function createSessionContainer(
+  mode: NetworkMode,
+): Promise<Docker.Container> {
   try {
     const created = await docker.createContainer({
       name: CONTAINER_NAME,
@@ -119,7 +116,8 @@ async function ensureSessionContainer(): Promise<Docker.Container> {
         Memory: MEM_BYTES,
         NanoCpus: NANO_CPUS,
         PidsLimit: PID_LIMIT,
-        NetworkMode: "bridge",
+        // Step 6: "bridge" で通常、"none" でネットワーク隔離
+        NetworkMode: mode,
         // 「ALL ドロップ → 必要分だけ加え戻す」方針。
         // SETUID/SETGID/CHOWN は apt などが内部で権限降格・ファイルオーナー変更に使う。
         // DAC_OVERRIDE/FOWNER/FSETID は /var/lib/apt などの書き込みに関わる。
@@ -136,10 +134,10 @@ async function ensureSessionContainer(): Promise<Docker.Container> {
       },
     });
     await created.start();
-    console.log(`[docker] created container: ${CONTAINER_NAME}`);
+    console.log(`[docker] created container: ${CONTAINER_NAME} (NetworkMode=${mode})`);
     return created;
   } catch (err) {
-    // 並行で他リクエストが先に作ったケース（409 Conflict）
+    // 並行で他リクエストが先に作ったケース（409 Conflict）: 既存を使う
     const status = (err as { statusCode?: number }).statusCode;
     if (status === 409) {
       const existing = docker.getContainer(CONTAINER_NAME);
@@ -149,6 +147,26 @@ async function ensureSessionContainer(): Promise<Docker.Container> {
     }
     throw err;
   }
+}
+
+// 単一の永続コンテナを ensure する。
+// - 無ければ作成（モードはデフォルト bridge）
+// - 止まっていれば start
+// - 動いていればそのまま返す
+async function ensureSessionContainer(): Promise<Docker.Container> {
+  const existing = docker.getContainer(CONTAINER_NAME);
+  try {
+    const info = await existing.inspect();
+    if (!info.State.Running) {
+      await existing.start();
+      console.log(`[docker] started existing container: ${CONTAINER_NAME}`);
+    }
+    return existing;
+  } catch (err) {
+    const status = (err as { statusCode?: number }).statusCode;
+    if (status !== 404) throw err;
+  }
+  return createSessionContainer(DEFAULT_NETWORK_MODE);
 }
 
 // 明示破棄: DELETE /api/session から呼ぶ。コンテナごと消す。
@@ -164,6 +182,62 @@ export async function removeSessionContainer(): Promise<boolean> {
     if (status === 404) return false; // そもそも無かった
     throw err;
   }
+}
+
+export type SessionStatus = {
+  exists: boolean;
+  running: boolean;
+  networkMode: NetworkMode;
+};
+
+// 現在のセッションコンテナの状態を返す。UI がヘッダに表示するのに使う。
+// 唯一の真は docker daemon 側の HostConfig.NetworkMode。コンテナが無ければ
+// デフォルトモード（次に作られるときのモード）を返す。
+export async function getSessionStatus(): Promise<SessionStatus> {
+  try {
+    const info = await docker.getContainer(CONTAINER_NAME).inspect();
+    const raw = info.HostConfig?.NetworkMode;
+    const mode: NetworkMode = raw === "none" ? "none" : "bridge";
+    return {
+      exists: true,
+      running: Boolean(info.State?.Running),
+      networkMode: mode,
+    };
+  } catch (err) {
+    const status = (err as { statusCode?: number }).statusCode;
+    if (status === 404) {
+      return { exists: false, running: false, networkMode: DEFAULT_NETWORK_MODE };
+    }
+    throw err;
+  }
+}
+
+// ネットワークモードを切り替える。Docker では NetworkMode は作成時に確定
+// するため、既存コンテナを force remove してから新モードで作成し直す。
+// この関数内で作成まで終わらせるのは、preferredNetworkMode を module 変数
+// で保持すると Next.js API route と custom server で別バンドルになり変数が
+// 共有されない事故が起きるため（一度それでハマった）。
+// 戻り値: コンテナを作り直したか (＝モードが変わったか)。
+export async function setSessionNetworkMode(mode: NetworkMode): Promise<boolean> {
+  let hadExisting = false;
+  try {
+    const info = await docker.getContainer(CONTAINER_NAME).inspect();
+    const current = info.HostConfig?.NetworkMode === "none" ? "none" : "bridge";
+    if (current === mode) {
+      // 既に同じモードなら触らない
+      return false;
+    }
+    await docker.getContainer(CONTAINER_NAME).remove({ force: true });
+    console.log(
+      `[docker] removed container for network-mode switch: ${current} -> ${mode}`,
+    );
+    hadExisting = true;
+  } catch (err) {
+    const status = (err as { statusCode?: number }).statusCode;
+    if (status !== 404) throw err;
+  }
+  await createSessionContainer(mode);
+  return hadExisting;
 }
 
 export function attachDockerSession(ws: WebSocket): void {
