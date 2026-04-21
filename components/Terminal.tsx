@@ -129,7 +129,13 @@ export default function Terminal() {
       fontFamily:
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace',
       fontSize: 13,
+      // allowTransparency 自体は v6 ではほぼ no-op（theme.background の
+      // parseColor が rgba を reject するため）。実際の透過は globals.css の
+      // .xterm / .xterm-viewport の background-color override で実現する。
+      allowTransparency: true,
       theme: {
+        // ここは DomRenderer が inverted fg などの計算に使う。実際の viewport
+        // 背景は CSS で transparent になるので、この値は文字の影響しか出ない。
         background: "#0b1020",
         foreground: "#e6e6e6",
       },
@@ -192,7 +198,7 @@ export default function Terminal() {
     if (busy) return;
     if (
       !confirm(
-        "コンテナを削除すると、/root 以外にインストールしたパッケージや設定は失われます。続行しますか？",
+        "コンテナを作り直します。/root 以外にインストール/作成したもの（apt のパッケージ、/tmp のファイル等）は失われます。続行しますか？",
       )
     ) {
       return;
@@ -266,44 +272,58 @@ export default function Terminal() {
       : networkMode === "none"
         ? "ネットワーク: 遮断"
         : "ネットワーク: 接続";
-  const netSwitchLabel =
-    networkMode == null
-      ? "…"
-      : networkMode === "none"
-        ? "ネットワークを有効化"
-        : "ネットワークを遮断";
 
   return (
     <div className="flex h-screen flex-col bg-[#0b1020] text-slate-200">
-      <header className="flex items-center justify-between border-b border-slate-700 px-4 py-2 text-sm">
+      <header className="flex items-center justify-between border-b border-slate-700 bg-[#0b1020] px-4 py-2 text-sm">
         <span className="font-semibold">PTY Sandbox</span>
-        <div className="flex items-center gap-3">
-          <span
-            className={
-              networkMode === "none"
-                ? "text-orange-300"
-                : networkMode === "bridge"
-                  ? "text-sky-300"
-                  : "text-slate-500"
-            }
-            title={
-              networkMode === "none"
-                ? "NetworkMode: none（lo のみ、DNS・外部通信不可）"
-                : networkMode === "bridge"
-                  ? "NetworkMode: bridge（通常の外部通信あり）"
-                  : ""
-            }
-          >
-            {netLabel}
-          </span>
-          <button
-            type="button"
-            onClick={switchNetworkMode}
-            disabled={busy || networkMode == null}
-            className="rounded border border-slate-600 px-2 py-0.5 text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-50"
-          >
-            {netSwitchLabel}
-          </button>
+        <div className="flex items-center gap-4">
+          {/* ネットワーク トグルスイッチ (bridge ⇔ none) */}
+          <div className="flex items-center gap-2">
+            <span
+              className={
+                networkMode === "none"
+                  ? "text-orange-300"
+                  : networkMode === "bridge"
+                    ? "text-sky-300"
+                    : "text-slate-500"
+              }
+              title={
+                networkMode === "none"
+                  ? "NetworkMode: none（lo のみ、DNS・外部通信不可）"
+                  : networkMode === "bridge"
+                    ? "NetworkMode: bridge（通常の外部通信あり）"
+                    : ""
+              }
+            >
+              {netLabel}
+            </span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={networkMode === "bridge"}
+              aria-label="ネットワーク接続/遮断トグル"
+              onClick={switchNetworkMode}
+              disabled={busy || networkMode == null}
+              className={`relative inline-flex h-5 w-10 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-offset-2 focus:ring-offset-[#0b1020] disabled:cursor-not-allowed disabled:opacity-50 ${
+                networkMode === "bridge"
+                  ? "bg-sky-600"
+                  : networkMode === "none"
+                    ? "bg-orange-600"
+                    : "bg-slate-600"
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${
+                  networkMode === "bridge"
+                    ? "translate-x-5"
+                    : "translate-x-0.5"
+                }`}
+              />
+            </button>
+          </div>
+
+          {/* 接続状態（WebSocket） */}
           <span
             className={
               status === "open"
@@ -324,17 +344,60 @@ export default function Terminal() {
               再接続
             </button>
           )}
+
+          {/* コンテナを作り直す（旧「セッション破棄」）。
+              アイコンのみ + tooltip で、誤操作しづらく、かつ意味が伝わるようにする。 */}
           <button
             type="button"
             onClick={destroySession}
             disabled={busy}
-            className="rounded border border-rose-700 px-2 py-0.5 text-xs text-rose-300 hover:bg-rose-950 disabled:opacity-50"
+            title="コンテナを作り直す（/root 以外はリセット）"
+            aria-label="コンテナを作り直す"
+            className="rounded p-1.5 text-slate-300 transition-colors hover:bg-slate-800 hover:text-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {busy ? "破棄中…" : "セッション破棄"}
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className={`h-4 w-4 ${busy ? "animate-spin" : ""}`}
+              aria-hidden="true"
+            >
+              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+              <path d="M3 3v5h5" />
+            </svg>
           </button>
         </div>
       </header>
-      <div ref={containerRef} className="min-h-0 flex-1" />
+      {/*
+        ターミナル領域の裏に置く gradient + 中央の Ubuntu ロゴ。xterm 側の
+        background は globals.css で transparent にしてあるので、この背景
+        全体が文字の裏にうっすら透けて見える。
+      */}
+      <div
+        className="relative min-h-0 flex-1"
+        style={{
+          background:
+            "linear-gradient(135deg, #0b1020 0%, #1e293b 50%, #312e81 100%)",
+        }}
+      >
+        {/*
+          Ubuntu Circle of Friends ロゴマーク（サンドボックスの OS 種別を
+          視覚化するため）。SVG path は Simple Icons (CC0-1.0) 由来。Ubuntu
+          の名称・ロゴは Canonical Ltd. の商標。
+          pointer-events:none で xterm のクリック/選択を邪魔しない。
+        */}
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src="/ubuntu-logomark.svg"
+          alt=""
+          aria-hidden="true"
+          className="pointer-events-none absolute left-1/2 top-1/2 h-72 w-72 -translate-x-1/2 -translate-y-1/2 opacity-15"
+        />
+        <div ref={containerRef} className="absolute inset-0" />
+      </div>
     </div>
   );
 }
